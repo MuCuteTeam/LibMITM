@@ -43,7 +43,7 @@ const (
 	tcpKeepaliveInterval = 30 * time.Second
 )
 
-func withTCPHandler(dialer *net.Dialer, redirector Redirector) option.Option {
+func withTCPHandler(dialer *net.Dialer, redirector Redirector, eh EstablishHandler) option.Option {
 	return func(s *stack.Stack) error {
 		tcpForwarder := tcp.NewForwarder(s, defaultWndSize, maxConnAttempts, func(r *tcp.ForwarderRequest) {
 			var (
@@ -71,28 +71,14 @@ func withTCPHandler(dialer *net.Dialer, redirector Redirector) option.Option {
 				addr = addressId(id)
 			}
 
-			go func(local net.Conn, dialer *net.Dialer, addr string) {
-				defer local.Close()
-
-				remote, err := dialer.Dial("tcp", addr)
-				if err != nil {
-					log.Println("dial failed:", err)
-					return
-				}
-				defer remote.Close()
-
-				go func() {
-					io.Copy(local, remote)
-				}()
-				io.Copy(remote, local)
-			}(gonet.NewTCPConn(&wq, ep), dialer, addr)
+			go connectionForwarder("tcp", gonet.NewTCPConn(&wq, ep), dialer, addr, eh, addressId(id))
 		})
 		s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 		return nil
 	}
 }
 
-func withUDPHandler(dialer *net.Dialer, redirector Redirector) option.Option {
+func withUDPHandler(dialer *net.Dialer, redirector Redirector, eh EstablishHandler) option.Option {
 	return func(s *stack.Stack) error {
 		udpForwarder := udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
 			var (
@@ -114,21 +100,7 @@ func withUDPHandler(dialer *net.Dialer, redirector Redirector) option.Option {
 				addr = addressId(id)
 			}
 
-			go func(local net.Conn, dialer *net.Dialer, addr string) {
-				defer local.Close()
-
-				remote, err := dialer.Dial("udp", addr)
-				if err != nil {
-					log.Println("dial failed:", err)
-					return
-				}
-				defer remote.Close()
-
-				go func() {
-					io.Copy(local, remote)
-				}()
-				io.Copy(remote, local)
-			}(gonet.NewUDPConn(s, &wq, ep), dialer, addr)
+			go connectionForwarder("udp", gonet.NewUDPConn(s, &wq, ep), dialer, addr, eh, addressId(id))
 		})
 		s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
 		return nil
@@ -173,4 +145,24 @@ func addressId(id stack.TransportEndpointID) string {
 	} else {
 		return fmt.Sprintf("[%s]:%d", id.LocalAddress.String(), id.LocalPort)
 	}
+}
+
+func connectionForwarder(net string, local net.Conn, dialer *net.Dialer, addr string, eh EstablishHandler, ehMessage string) {
+	defer local.Close()
+
+	remote, err := dialer.Dial(net, addr)
+	if err != nil {
+		log.Println("dial failed:", err)
+		return
+	}
+	defer remote.Close()
+
+	if eh != nil {
+		eh.Handle(remote.LocalAddr().String(), ehMessage)
+	}
+
+	go func() {
+		io.Copy(local, remote)
+	}()
+	io.Copy(remote, local)
 }

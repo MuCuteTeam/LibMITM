@@ -8,8 +8,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-func createStack(options stack.Options, endpoint stack.LinkEndpoint, dialer *net.Dialer,
-	tcpRedirector Redirector, udpRedirector Redirector) (*stack.Stack, error) {
+func (t *TUN) createStack(options stack.Options, endpoint stack.LinkEndpoint, dialer *net.Dialer) (*stack.Stack, error) {
 
 	s := stack.New(options)
 
@@ -22,8 +21,8 @@ func createStack(options stack.Options, endpoint stack.LinkEndpoint, dialer *net
 		// before creating NIC, otherwise NIC would dispatch packets
 		// to stack and cause race condition.
 		// Initiate transport protocol (TCP/UDP) with given handler.
-		withTCPHandler(dialer, tcpRedirector),
-		withUDPHandler(dialer, udpRedirector),
+		withTCPHandler(dialer, t.TcpRedirector, t.TcpEstablishHandler),
+		withUDPHandler(dialer, t.UdpRedirector, t.UdpEstablishHandler),
 
 		// Create stack NIC and then bind link endpoint to it.
 		option.WithCreatingNIC(nicID, endpoint),

@@ -28,8 +28,10 @@ type TUN struct {
 	IPv6Config    int
 	FdProtector   Protector
 
-	UdpRedirector Redirector
-	TcpRedirector Redirector
+	TcpRedirector       Redirector
+	UdpRedirector       Redirector
+	TcpEstablishHandler EstablishHandler
+	UdpEstablishHandler EstablishHandler
 
 	file  *os.File
 	stack *stack.Stack
@@ -41,6 +43,10 @@ type Protector interface {
 
 type Redirector interface {
 	Redirect(src string, srcPort int, dst string, dstPort int) string
+}
+
+type EstablishHandler interface {
+	Handle(localAddr string, originalRemoteIp string)
 }
 
 func (t *TUN) AddLocalIP(ip string) {
@@ -113,7 +119,7 @@ func (t *TUN) Start() error {
 	if err != nil {
 		return err
 	}
-	t.stack, err = createStack(opts, ep, dialer, t.TcpRedirector, t.UdpRedirector)
+	t.stack, err = t.createStack(opts, ep, dialer)
 
 	return err
 }
