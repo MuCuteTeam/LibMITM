@@ -1,4 +1,4 @@
-# AndroTUN
+# LibMITM
 Dead simple gVisor netstack powered packet processing library on Android
 
 ## Build requirements

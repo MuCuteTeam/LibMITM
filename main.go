@@ -1,8 +1,10 @@
-package androtun
+package libmitm
 
 import (
-	"androtun/endpoint"
+	"libmitm/endpoint"
+	"net"
 	"os"
+	"syscall"
 
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -73,12 +75,21 @@ func (t *TUN) Start() error {
 		}
 	}
 
+	prot := t.FdProtector
+	dialer := &net.Dialer{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				// protect the socket to make it won't be forwarded into tun
+				prot.Protect(int32(fd))
+			})
+		},
+	}
 	var err error
 	ep, err := endpoint.NewRwEndpoint(t.FileDescriber, t.MTU)
 	if err != nil {
 		return err
 	}
-	t.stack, err = createStack(opts, ep, t.FdProtector)
+	t.stack, err = createStack(opts, ep, dialer)
 
 	return err
 }

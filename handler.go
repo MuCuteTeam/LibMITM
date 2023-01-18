@@ -1,13 +1,20 @@
-package androtun
+package libmitm
 
 import (
-	"androtun/option"
+	"fmt"
+	"io"
+	"libmitm/option"
 	"log"
+	"net"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const (
@@ -36,64 +43,123 @@ const (
 	tcpKeepaliveInterval = 30 * time.Second
 )
 
-func withTCPHandler(protector Protector) option.Option {
+func withTCPHandler(dialer *net.Dialer) option.Option {
 	return func(s *stack.Stack) error {
 		tcpForwarder := tcp.NewForwarder(s, defaultWndSize, maxConnAttempts, func(r *tcp.ForwarderRequest) {
 			var (
-				// wq  waiter.Queue
-				// ep  tcpip.Endpoint
-				// err tcpip.Error
+				wq waiter.Queue
+				// 	ep  tcpip.Endpoint
+				// 	err tcpip.Error
 				id = r.ID()
 			)
-			log.Println("forward tcp request %s:%d->%s:%d:",
-				id.RemoteAddress, id.RemotePort, id.LocalAddress, id.LocalPort)
 
-			// // Perform a TCP three-way handshake.
-			// ep, err = r.CreateEndpoint(&wq)
-			// if err != nil {
-			// 	// RST: prevent potential half-open TCP connection leak.
-			// 	r.Complete(true)
-			// 	return
-			// }
-			// defer r.Complete(false)
+			// Perform a TCP three-way handshake.
+			ep, err := r.CreateEndpoint(&wq)
+			if err != nil {
+				log.Println("create endpoint failed:", err)
+				r.Complete(true)
+				return
+			}
+			r.Complete(false)
 
-			// err = setSocketOptions(s, ep)
+			if err = setSocketOptions(s, ep); err != nil {
+				log.Printf("set socket options failed: %v\n", err)
+			}
 
-			// conn := &tcpConn{
-			// 	TCPConn: gonet.NewTCPConn(&wq, ep),
-			// 	id:      id,
-			// }
-			// handle(conn)
+			go func(local net.Conn, dialer *net.Dialer, addr string) {
+				defer local.Close()
+
+				remote, err := dialer.Dial("tcp", addr)
+				if err != nil {
+					log.Println("dial failed:", err)
+					return
+				}
+				defer remote.Close()
+
+				go func() {
+					io.Copy(local, remote)
+				}()
+				io.Copy(remote, local)
+			}(gonet.NewTCPConn(&wq, ep), dialer, addressId(id))
 		})
 		s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 		return nil
 	}
 }
 
-func withUDPHandler(protector Protector) option.Option {
+func withUDPHandler(dialer *net.Dialer) option.Option {
 	return func(s *stack.Stack) error {
 		udpForwarder := udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
 			var (
-				// wq waiter.Queue
+				wq waiter.Queue
 				id = r.ID()
 			)
-			log.Println("udp forwarder request %s:%d->%s:%d: %s",
+			log.Printf("udp forwarder request %s:%d->%s:%d\n",
 				id.RemoteAddress, id.RemotePort, id.LocalAddress, id.LocalPort)
 
-			// ep, err := r.CreateEndpoint(&wq)
-			// if err != nil {
-			// 	printf("udp forwarder request %s:%d->%s:%d: %s",
-			// 		id.RemoteAddress, id.RemotePort, id.LocalAddress, id.LocalPort, err)
-			// 	return
-			// }
+			ep, err := r.CreateEndpoint(&wq)
+			if err != nil {
+				log.Println(err.String())
+				return
+			}
 
-			// conn := &udpConn{
-			// 	UDPConn: gonet.NewUDPConn(s, &wq, ep),
-			// 	id:      id,
-			// }
-			// handle(conn)
+			go func(local net.Conn, dialer *net.Dialer, addr string) {
+				defer local.Close()
+
+				remote, err := dialer.Dial("udp", addr)
+				if err != nil {
+					log.Println("dial failed:", err)
+					return
+				}
+				defer remote.Close()
+
+				go func() {
+					io.Copy(local, remote)
+				}()
+				io.Copy(remote, local)
+			}(gonet.NewUDPConn(s, &wq, ep), dialer, addressId(id))
 		})
 		s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
 		return nil
+	}
+}
+
+func setSocketOptions(s *stack.Stack, ep tcpip.Endpoint) tcpip.Error {
+	{ /* TCP keepalive options */
+		ep.SocketOptions().SetKeepAlive(true)
+
+		idle := tcpip.KeepaliveIdleOption(tcpKeepaliveIdle)
+		if err := ep.SetSockOpt(&idle); err != nil {
+			return err
+		}
+
+		interval := tcpip.KeepaliveIntervalOption(tcpKeepaliveInterval)
+		if err := ep.SetSockOpt(&interval); err != nil {
+			return err
+		}
+
+		if err := ep.SetSockOptInt(tcpip.KeepaliveCountOption, tcpKeepaliveCount); err != nil {
+			return err
+		}
+	}
+	{ /* TCP recv/send buffer size */
+		var ss tcpip.TCPSendBufferSizeRangeOption
+		if err := s.TransportProtocolOption(header.TCPProtocolNumber, &ss); err == nil {
+			ep.SocketOptions().SetReceiveBufferSize(int64(ss.Default), false)
+		}
+
+		var rs tcpip.TCPReceiveBufferSizeRangeOption
+		if err := s.TransportProtocolOption(header.TCPProtocolNumber, &rs); err == nil {
+			ep.SocketOptions().SetReceiveBufferSize(int64(rs.Default), false)
+		}
+	}
+	return nil
+}
+
+func addressId(id stack.TransportEndpointID) string {
+	if len(id.LocalAddress) == 4 {
+		return fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+	} else {
+		return fmt.Sprintf("[%s]:%d", id.LocalAddress.String(), id.LocalPort)
 	}
 }

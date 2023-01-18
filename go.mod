@@ -1,4 +1,4 @@
-module androtun
+module libmitm
 
 go 1.19
 

@@ -1,13 +1,14 @@
-package androtun
+package libmitm
 
 import (
-	"androtun/option"
+	"libmitm/option"
+	"net"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-func createStack(options stack.Options, endpoint stack.LinkEndpoint, protector Protector) (*stack.Stack, error) {
+func createStack(options stack.Options, endpoint stack.LinkEndpoint, dialer *net.Dialer) (*stack.Stack, error) {
 	s := stack.New(options)
 
 	// Generate unique NIC id.
@@ -19,8 +20,8 @@ func createStack(options stack.Options, endpoint stack.LinkEndpoint, protector P
 		// before creating NIC, otherwise NIC would dispatch packets
 		// to stack and cause race condition.
 		// Initiate transport protocol (TCP/UDP) with given handler.
-		withTCPHandler(protector),
-		withUDPHandler(protector),
+		withTCPHandler(dialer),
+		withUDPHandler(dialer),
 
 		// Create stack NIC and then bind link endpoint to it.
 		option.WithCreatingNIC(nicID, endpoint),
