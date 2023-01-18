@@ -43,7 +43,7 @@ const (
 	tcpKeepaliveInterval = 30 * time.Second
 )
 
-func withTCPHandler(dialer *net.Dialer) option.Option {
+func withTCPHandler(dialer *net.Dialer, redirector Redirector) option.Option {
 	return func(s *stack.Stack) error {
 		tcpForwarder := tcp.NewForwarder(s, defaultWndSize, maxConnAttempts, func(r *tcp.ForwarderRequest) {
 			var (
@@ -56,14 +56,19 @@ func withTCPHandler(dialer *net.Dialer) option.Option {
 			// Perform a TCP three-way handshake.
 			ep, err := r.CreateEndpoint(&wq)
 			if err != nil {
-				log.Println("create endpoint failed:", err)
 				r.Complete(true)
 				return
 			}
 			r.Complete(false)
 
-			if err = setSocketOptions(s, ep); err != nil {
-				log.Printf("set socket options failed: %v\n", err)
+			setSocketOptions(s, ep)
+
+			var addr string
+			if redirector != nil {
+				addr = redirector.Redirect(id.RemoteAddress.String(), int(id.RemotePort), id.LocalAddress.String(), int(id.LocalPort))
+			}
+			if addr == "" {
+				addr = addressId(id)
 			}
 
 			go func(local net.Conn, dialer *net.Dialer, addr string) {
@@ -80,27 +85,33 @@ func withTCPHandler(dialer *net.Dialer) option.Option {
 					io.Copy(local, remote)
 				}()
 				io.Copy(remote, local)
-			}(gonet.NewTCPConn(&wq, ep), dialer, addressId(id))
+			}(gonet.NewTCPConn(&wq, ep), dialer, addr)
 		})
 		s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 		return nil
 	}
 }
 
-func withUDPHandler(dialer *net.Dialer) option.Option {
+func withUDPHandler(dialer *net.Dialer, redirector Redirector) option.Option {
 	return func(s *stack.Stack) error {
 		udpForwarder := udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
 			var (
 				wq waiter.Queue
 				id = r.ID()
 			)
-			log.Printf("udp forwarder request %s:%d->%s:%d\n",
-				id.RemoteAddress, id.RemotePort, id.LocalAddress, id.LocalPort)
 
 			ep, err := r.CreateEndpoint(&wq)
 			if err != nil {
 				log.Println(err.String())
 				return
+			}
+
+			var addr string
+			if redirector != nil {
+				addr = redirector.Redirect(id.RemoteAddress.String(), int(id.RemotePort), id.LocalAddress.String(), int(id.LocalPort))
+			}
+			if addr == "" {
+				addr = addressId(id)
 			}
 
 			go func(local net.Conn, dialer *net.Dialer, addr string) {
@@ -117,7 +128,7 @@ func withUDPHandler(dialer *net.Dialer) option.Option {
 					io.Copy(local, remote)
 				}()
 				io.Copy(remote, local)
-			}(gonet.NewUDPConn(s, &wq, ep), dialer, addressId(id))
+			}(gonet.NewUDPConn(s, &wq, ep), dialer, addr)
 		})
 		s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
 		return nil
