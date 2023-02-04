@@ -1,22 +1,22 @@
 package endpoint
 
 import (
-	"fmt"
-
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// bufConfig defines the shape of the vectorised view used to read packets from the NIC.
-var bufConfig = []int{128, 256, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}
+// BufConfig defines the shape of the buffer used to read packets from the NIC.
+var BufConfig = []int{128, 256, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}
 
 type iovecBuffer struct {
-	// views are the actual buffers that hold the packet contents.
-	views []buffer.View
+	// buffer is the actual buffer that holds the packet contents. Some contents
+	// are reused across calls to pullBuffer if number of requested bytes is
+	// smaller than the number of bytes allocated in the buffer.
+	views []*bufferv2.View
 
 	// iovecs are initialized with base pointers/len of the corresponding
 	// entries in the views defined above, except when GSO is enabled
@@ -28,72 +28,75 @@ type iovecBuffer struct {
 	// sizes is an array of buffer sizes for the underlying views. sizes is
 	// immutable.
 	sizes []int
+
+	// skipsVnetHdr is true if virtioNetHdr is to skipped.
+	// skipsVnetHdr bool
+
+	// pulledIndex is the index of the last []byte buffer pulled from the
+	// underlying buffer storage during a call to pullBuffers. It is -1
+	// if no buffer is pulled.
+	// pulledIndex int
 }
 
 func newIovecBuffer(sizes []int) *iovecBuffer {
 	b := &iovecBuffer{
-		views: make([]buffer.View, len(sizes)),
+		views: make([]*bufferv2.View, len(sizes)),
 		sizes: sizes,
 	}
-	b.iovecs = make([]unix.Iovec, len(b.views))
+	niov := len(b.views)
+	b.iovecs = make([]unix.Iovec, niov)
 	return b
 }
 
 func (b *iovecBuffer) nextIovecs() []unix.Iovec {
 	vnetHdrOff := 0
+
 	for i := range b.views {
 		if b.views[i] != nil {
 			break
 		}
-		v := buffer.NewView(b.sizes[i])
+		v := bufferv2.NewViewSize(b.sizes[i])
 		b.views[i] = v
-		b.iovecs[i+vnetHdrOff] = unix.Iovec{Base: &v[0]}
-		b.iovecs[i+vnetHdrOff].SetLen(len(v))
+		b.iovecs[i+vnetHdrOff] = unix.Iovec{Base: v.BasePtr()}
+		b.iovecs[i+vnetHdrOff].SetLen(v.Size())
 	}
 	return b.iovecs
 }
 
-func (b *iovecBuffer) pullViews(n int) buffer.VectorisedView {
-	var views []buffer.View
+// pullBuffer extracts the enough underlying storage from b.buffer to hold n
+// bytes. It removes this storage from b.buffer, returns a new buffer
+// that holds the storage, and updates pulledIndex to indicate which part
+// of b.buffer's storage must be reallocated during the next call to
+// nextIovecs.
+func (b *iovecBuffer) pullBuffer(n int) bufferv2.Buffer {
+	var views []*bufferv2.View
 	c := 0
+	// Remove the used views from the buffer.
 	for i, v := range b.views {
-		c += len(v)
+		c += v.Size()
 		if c >= n {
-			b.views[i].CapLength(len(v) - (c - n))
-			views = append([]buffer.View(nil), b.views[:i+1]...)
+			b.views[i].CapLength(v.Size() - (c - n))
+			views = append(views, b.views[:i+1]...)
 			break
 		}
 	}
-	// Remove the first len(views) used views from the state.
 	for i := range views {
 		b.views[i] = nil
 	}
-	return buffer.NewVectorisedView(n, views)
-}
-
-// stopFd is an eventfd used to signal the stop of a dispatcher.
-type stopFd struct {
-	efd int
-}
-
-func newStopFd() (stopFd, error) {
-	efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK)
-	if err != nil {
-		return stopFd{efd: -1}, fmt.Errorf("failed to create eventfd: %w", err)
+	pulled := bufferv2.Buffer{}
+	for _, v := range views {
+		pulled.Append(v)
 	}
-	return stopFd{efd: efd}, nil
+	pulled.Truncate(int64(n))
+	return pulled
 }
 
-// stop writes to the eventfd and notifies the dispatcher to stop. It does not
-// block.
-func (s *stopFd) stop() {
-	increment := []byte{1, 0, 0, 0, 0, 0, 0, 0}
-	if n, err := unix.Write(s.efd, increment); n != len(increment) || err != nil {
-		// There are two possible errors documented in eventfd(2) for writing:
-		// 1. We are writing 8 bytes and not 0xffffffffffffff, thus no EINVAL.
-		// 2. stop is only supposed to be called once, it can't reach the limit,
-		// thus no EAGAIN.
-		panic(fmt.Sprintf("write(efd) = (%d, %s), want (%d, nil)", n, err, len(increment)))
+func (b *iovecBuffer) release() {
+	for _, v := range b.views {
+		if v != nil {
+			v.Release()
+			v = nil
+		}
 	}
 }
 
@@ -105,13 +108,13 @@ type readVDispatcher struct {
 	fd int
 
 	// e is the endpoint this dispatcher is attached to.
-	e *rwEndpoint
+	e *endpoint
 
 	// buf is the iovec buffer that contains the packet contents.
 	buf *iovecBuffer
 }
 
-func newReadVDispatcher(fd int, e *rwEndpoint) (*readVDispatcher, error) {
+func newReadVDispatcher(fd int, e *endpoint) (*readVDispatcher, error) {
 	stopFd, err := newStopFd()
 	if err != nil {
 		return nil, err
@@ -121,8 +124,12 @@ func newReadVDispatcher(fd int, e *rwEndpoint) (*readVDispatcher, error) {
 		fd:     fd,
 		e:      e,
 	}
-	d.buf = newIovecBuffer(bufConfig)
+	d.buf = newIovecBuffer(BufConfig)
 	return d, nil
+}
+
+func (d *readVDispatcher) release() {
+	d.buf.release()
 }
 
 // dispatch reads one packet from the file descriptor and dispatches it.
@@ -133,13 +140,11 @@ func (d *readVDispatcher) dispatch() (bool, tcpip.Error) {
 	}
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Data:              d.buf.pullViews(n),
-		IsForwardedPacket: true,
+		Payload: d.buf.pullBuffer(n),
 	})
 	defer pkt.DecRef()
 
 	var p tcpip.NetworkProtocolNumber
-
 	// We don't get any indication of what the packet is, so try to guess
 	// if it's an IPv4 or IPv6 packet.
 	// IP version information is at the first octet, so pulling up 1 byte.

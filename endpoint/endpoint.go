@@ -4,16 +4,17 @@ import (
 	"sync"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-var _ stack.InjectableLinkEndpoint = (*rwEndpoint)(nil)
+var _ stack.InjectableLinkEndpoint = (*endpoint)(nil)
 
-// rwEndpoint implements the interface of stack.LinkEndpoint from io.ReadWriter.
-type rwEndpoint struct {
+// endpoint implements the interface of stack.LinkEndpoint from io.ReadWriter.
+type endpoint struct {
 	fd int
 
 	// mtu (maximum transmission unit) is the maximum size of a packet.
@@ -24,8 +25,8 @@ type rwEndpoint struct {
 	dispatcher stack.NetworkDispatcher
 }
 
-func NewRwEndpoint(dev int32, mtu int32) (*rwEndpoint, error) {
-	e := &rwEndpoint{
+func NewEndpoint(dev int32, mtu int32) (*endpoint, error) {
+	e := &endpoint{
 		fd:  int(dev),
 		mtu: uint32(mtu),
 	}
@@ -37,17 +38,17 @@ func NewRwEndpoint(dev int32, mtu int32) (*rwEndpoint, error) {
 	return e, nil
 }
 
-func (e *rwEndpoint) InjectInbound(networkProtocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (e *endpoint) InjectInbound(networkProtocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
 	go e.dispatcher.DeliverNetworkPacket(networkProtocol, pkt)
 }
 
-func (e *rwEndpoint) InjectOutbound(dest tcpip.Address, packet []byte) tcpip.Error {
-	return rawfile.NonBlockingWrite(e.fd, packet)
+func (e *endpoint) InjectOutbound(dest tcpip.Address, packet *bufferv2.View) tcpip.Error {
+	return rawfile.NonBlockingWrite(e.fd, packet.AsSlice())
 }
 
 // Attach launches the goroutine that reads packets from io.ReadWriter and
 // dispatches them via the provided dispatcher.
-func (e *rwEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
+func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	if dispatcher == nil && e.dispatcher != nil {
 		e.inbound.stop()
 		e.Wait()
@@ -65,31 +66,31 @@ func (e *rwEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 }
 
 // IsAttached implements stack.LinkEndpoint.IsAttached.
-func (e *rwEndpoint) IsAttached() bool {
+func (e *endpoint) IsAttached() bool {
 	return e.dispatcher != nil
 }
 
 // dispatchLoop reads packets from the file descriptor in a loop and dispatches
 // them to the network stack.
-func (e *rwEndpoint) dispatchLoop(inboundDispatcher *readVDispatcher) tcpip.Error {
+func (e *endpoint) dispatchLoop(inboundDispatcher *readVDispatcher) tcpip.Error {
 	for {
 		cont, err := inboundDispatcher.dispatch()
 		if err != nil || !cont {
+			inboundDispatcher.release()
 			return err
 		}
 	}
 }
 
-// WritePackets writes packets back into io.ReadWriter.
-func (e *rwEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	// Preallocate to avoid repeated reallocation as we append to batch.
 	// batchSz is 47 because when SWGSO is in use then a single 65KB TCP
 	// segment can get split into 46 segments of 1420 bytes and a single 216
 	// byte segment.
 	const batchSz = 47
 	batch := make([]unix.Iovec, 0, batchSz)
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
-		views := pkt.Views()
+	for _, pkt := range pkts.AsSlice() {
+		views := pkt.AsSlices()
 		for _, v := range views {
 			batch = rawfile.AppendIovecFromBytes(batch, v, len(views))
 		}
@@ -102,35 +103,35 @@ func (e *rwEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error
 }
 
 // MTU implements stack.LinkEndpoint.MTU.
-func (e *rwEndpoint) MTU() uint32 {
+func (e *endpoint) MTU() uint32 {
 	return e.mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.
-func (e *rwEndpoint) Capabilities() stack.LinkEndpointCapabilities {
+func (e *endpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return stack.CapabilityNone
 }
 
 // MaxHeaderLength returns the maximum size of the link layer header. Given it
 // doesn't have a header, it just returns 0.
-func (*rwEndpoint) MaxHeaderLength() uint16 {
+func (*endpoint) MaxHeaderLength() uint16 {
 	return 0
 }
 
 // LinkAddress returns the link address of this endpoint.
-func (*rwEndpoint) LinkAddress() tcpip.LinkAddress {
+func (*endpoint) LinkAddress() tcpip.LinkAddress {
 	return ""
 }
 
 // ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.
-func (*rwEndpoint) ARPHardwareType() header.ARPHardwareType {
+func (*endpoint) ARPHardwareType() header.ARPHardwareType {
 	return header.ARPHardwareNone
 }
 
-func (e *rwEndpoint) AddHeader(*stack.PacketBuffer) {
+func (e *endpoint) AddHeader(stack.PacketBufferPtr) {
 }
 
 // Wait implements stack.LinkEndpoint.Wait.
-func (e *rwEndpoint) Wait() {
+func (e *endpoint) Wait() {
 	e.wg.Wait()
 }

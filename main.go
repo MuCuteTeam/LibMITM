@@ -115,7 +115,7 @@ func (t *TUN) Start() error {
 		},
 	}
 	var err error
-	ep, err := endpoint.NewRwEndpoint(t.FileDescriber, t.MTU)
+	ep, err := endpoint.NewEndpoint(t.FileDescriber, t.MTU)
 	if err != nil {
 		return err
 	}
