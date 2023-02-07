@@ -4,8 +4,6 @@ import (
 	"libmitm/endpoint"
 	"net"
 	"os"
-	"strings"
-	"syscall"
 
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -24,9 +22,7 @@ const (
 type TUN struct {
 	FileDescriber int32
 	MTU           int32
-	LocalIP       []string
 	IPv6Config    int
-	FdProtector   Protector
 
 	TcpRedirector       Redirector
 	UdpRedirector       Redirector
@@ -37,25 +33,12 @@ type TUN struct {
 	stack *stack.Stack
 }
 
-type Protector interface {
-	Protect(fd int32) bool
-}
-
 type Redirector interface {
 	Redirect(src string, srcPort int, dst string, dstPort int) string
 }
 
 type EstablishHandler interface {
 	Handle(localAddr string, originalRemoteIp string)
-}
-
-func (t *TUN) AddLocalIP(ip string) {
-	if t.LocalIP == nil {
-		t.LocalIP = make([]string, 1)
-		t.LocalIP[0] = ip
-	} else {
-		t.LocalIP = append(t.LocalIP, ip)
-	}
 }
 
 func (t *TUN) Start() error {
@@ -98,22 +81,7 @@ func (t *TUN) Start() error {
 		}
 	}
 
-	prot := t.FdProtector
-	localIPs := t.LocalIP
-	if localIPs == nil {
-		localIPs = make([]string, 0)
-	}
-	dialer := &net.Dialer{
-		Control: func(network, address string, c syscall.RawConn) error {
-			if contains(localIPs, address[:strings.LastIndex(address, ":")]) {
-				return nil
-			}
-			return c.Control(func(fd uintptr) {
-				// protect the socket to make it won't be forwarded into tun
-				prot.Protect(int32(fd))
-			})
-		},
-	}
+	dialer := &net.Dialer{}
 	var err error
 	ep, err := endpoint.NewEndpoint(t.FileDescriber, t.MTU)
 	if err != nil {
